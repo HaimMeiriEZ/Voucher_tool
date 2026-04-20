@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak
+*.swp
+*.csv
+*.xlsx
+voucher_state.json
+.DS_Store
+Thumbs.db
+.vscode/
