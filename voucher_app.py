@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Callable, Dict, Optional
 
 import pandas as pd
+from openpyxl import load_workbook
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -58,6 +59,37 @@ def safe_datetime(value, *, dayfirst: bool = False) -> Optional[datetime]:
     return result.to_pydatetime()
 
 
+def build_alert_fields(days_to_departure: Optional[int], is_private: bool) -> tuple[str, str, str, str]:
+    if not is_private or days_to_departure is None:
+        return "", "", "", ""
+
+    if 8 <= days_to_departure <= 14:
+        category = "התראה שבועיים לפני היציאה"
+        body = (
+            "הלקוחות הבאים אמורים לצאת מהארץ בשבועיים הקרובים וטרם נגבה בגינם תשלום ההזמנה, "
+            "במידה ותוך שבוע לא תתבצע גבייה היא תבוטל לאלתר בכדי למנוע הפסד לחברה"
+        )
+        reason = "חוסר גבייה כשבועיים לפני היציאה"
+    elif 0 <= days_to_departure <= 7:
+        category = "עלול להתבטל"
+        body = (
+            "הזמנת הלקוח טרם נגבתה, ואמורה לצאת לפועל תוך שבוע – לכן היא מיועדת לביטול ותבוטל עד סוף היום"
+        )
+        reason = "חוסר גבייה לפני היציאה"
+    else:
+        return "", "", "", ""
+
+    return category, body, category, reason
+
+
+def clean_numeric_series(series: pd.Series) -> pd.Series:
+    cleaned = series.astype(str).str.replace(",", "", regex=False).str.strip()
+    cleaned = cleaned.replace("", pd.NA)
+    cleaned = cleaned.replace("nan", pd.NA)
+    cleaned = cleaned.replace("None", pd.NA)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 class BaseVoucherProcessor:
     source_name = "BASE"
     history_key_columns = []
@@ -84,7 +116,7 @@ class BaseVoucherProcessor:
             json.dump(state, file, ensure_ascii=False, indent=2)
 
     def get_anchor_date(self, input_path: str) -> datetime:
-        return datetime.fromtimestamp(os.path.getmtime(input_path))
+        return datetime.now()
 
     def build_history_map(self, output_dir: str) -> Dict[str, Dict[str, str]]:
         if not output_dir or not os.path.exists(output_dir):
@@ -150,7 +182,53 @@ class BaseVoucherProcessor:
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%d.%m.%y %H.%M")
         output_path = os.path.join(output_dir, f"דוח בקרה וואוצרים {self.source_name} {timestamp}.xlsx")
-        df.to_excel(output_path, index=False)
+
+        warning_14 = pd.DataFrame()
+        threat_7 = pd.DataFrame()
+        if "קטגוריית התראה" in df.columns:
+            warning_14 = df[df["קטגוריית התראה"] == "התראה שבועיים לפני היציאה"].copy()
+            threat_7 = df[df["קטגוריית התראה"] == "עלול להתבטל"].copy()
+
+        drop_columns = ["קטגוריית התראה", "סיבת התראה"]
+        if any(column in df.columns for column in drop_columns):
+            df = df.drop(columns=drop_columns, errors="ignore")
+            warning_14 = warning_14.drop(columns=drop_columns, errors="ignore")
+            threat_7 = threat_7.drop(columns=drop_columns, errors="ignore")
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="דוח מלא", index=False)
+            if not warning_14.empty:
+                warning_14.to_excel(writer, sheet_name="אזהרה שבועיים", index=False)
+            if not threat_7.empty:
+                threat_7.to_excel(writer, sheet_name="איום שבוע", index=False)
+
+        workbook = load_workbook(output_path)
+        date_columns = {"Open", "Start", "Start Date", "End Date", "תאריך עידכון הערת סוכן"}
+        integer_columns = {"Number", "מס' ימים ליציאה", "מס' ימי החזר"}
+        decimal_columns = {"Ref wl", "Attr", "Credit", "Balance", "Unconfirmed Refund"}
+
+        for worksheet in workbook.worksheets:
+            headers = {cell.value: index + 1 for index, cell in enumerate(worksheet[1])}
+            for column_name in date_columns:
+                col_idx = headers.get(column_name)
+                if not col_idx:
+                    continue
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row=row, column=col_idx).number_format = "DD/MM/YYYY"
+            for column_name in integer_columns:
+                col_idx = headers.get(column_name)
+                if not col_idx:
+                    continue
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row=row, column=col_idx).number_format = "0"
+            for column_name in decimal_columns:
+                col_idx = headers.get(column_name)
+                if not col_idx:
+                    continue
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row=row, column=col_idx).number_format = "#,##0.00"
+
+        workbook.save(output_path)
         return output_path
 
     def process(self, input_path: str, output_dir: str) -> str:
@@ -188,13 +266,6 @@ class BoosterProcessor(BaseVoucherProcessor):
     history_key_columns = ["מזהה רשומה", "T. File No."]
 
     def get_anchor_date(self, input_path: str) -> datetime:
-        file_name = os.path.basename(input_path)
-        date_match = re.search(r"(\d{1,2}\s\w{3}\s\d{4})", file_name)
-        if date_match:
-            try:
-                return datetime.strptime(date_match.group(1), "%d %b %Y")
-            except ValueError:
-                pass
         return super().get_anchor_date(input_path)
 
     def load_input(self, input_path: str) -> pd.DataFrame:
@@ -240,6 +311,7 @@ class BoosterProcessor(BaseVoucherProcessor):
         df["מקור"] = self.source_name
         df["מזהה רשומה"] = df["T. File No."].apply(normalize_identifier)
 
+        run_date = anchor_date.date()
         calc_columns = []
         for _, row in df.iterrows():
             record_id = normalize_identifier(row["T. File No."])
@@ -247,8 +319,10 @@ class BoosterProcessor(BaseVoucherProcessor):
             if start_date is not None:
                 state[f"{self.source_name}:{record_id}"] = {"open_date": str(start_date)}
 
-            is_direct = safe_text(row["Agent/C. Client"]) == "Direct Sale"
-            days_to_departure = (start_date - anchor_date).days if (is_direct and start_date is not None) else ""
+            start_date_only = start_date.date() if start_date is not None else None
+            days_to_departure = (
+                int((start_date_only - run_date).days) if start_date_only is not None else None
+            )
 
             state_entry = state.get(f"{self.source_name}:{record_id}", {})
             open_date = safe_datetime(state_entry.get("open_date", ""))
@@ -260,7 +334,12 @@ class BoosterProcessor(BaseVoucherProcessor):
             if refund_value > 0:
                 refund_note = "החזר שטרם אושר מעל 60 יום" if days_since_refund > 60 else "החזר שטרם אושר"
 
-            if is_direct:
+            is_private = safe_text(row["Agent/C. Client"]) == "Direct Sale"
+            alert_category, email_body, email_target, alert_reason = build_alert_fields(
+                days_to_departure, is_private
+            )
+
+            if safe_text(row["Agent/C. Client"]) == "Direct Sale":
                 system_note = refund_note
             else:
                 system_note = f"{refund_note}; טרם הופקה חשבונית" if refund_note else "טרם הופקה חשבונית"
@@ -273,6 +352,12 @@ class BoosterProcessor(BaseVoucherProcessor):
                     system_note,
                     hist.get("הערות סוכן", ""),
                     hist.get("תאריך עידכון הערת סוכן", ""),
+                    alert_category,
+                    email_body,
+                    email_target,
+                    alert_reason,
+                    "",
+                    "",
                 ]
             )
 
@@ -283,8 +368,15 @@ class BoosterProcessor(BaseVoucherProcessor):
                 "הערות",
                 "הערות סוכן",
                 "תאריך עידכון הערת סוכן",
+                "קטגוריית התראה",
+                "גוף דוא״ל",
+                "email_target",
+                "סיבת התראה",
+                "email_employee",
+                "email_direct_manager",
             ]
         ] = pd.DataFrame(calc_columns, index=df.index)
+        df["email_department_manager"] = ""
 
         preferred = [
             "מקור",
@@ -302,6 +394,13 @@ class BoosterProcessor(BaseVoucherProcessor):
             "הערות",
             "הערות סוכן",
             "תאריך עידכון הערת סוכן",
+            "קטגוריית התראה",
+            "סיבת התראה",
+            "גוף דוא״ל",
+            "email_target",
+            "email_employee",
+            "email_direct_manager",
+            "email_department_manager",
         ]
         return df[preferred]
 
@@ -338,29 +437,42 @@ class GilboaProcessor(BaseVoucherProcessor):
         history: Dict[str, Dict[str, str]],
         anchor_date: datetime,
     ) -> pd.DataFrame:
+        df["Open"] = pd.to_datetime(df["Open"], format="%d/%m/%Y", errors="coerce")
+        df["Start"] = pd.to_datetime(df["Start"], format="%d/%m/%Y", errors="coerce")
+
+        for numeric_column in ["Number", "Ref wl", "Attr", "Credit", "Balance"]:
+            if numeric_column in df.columns:
+                df[numeric_column] = clean_numeric_series(df[numeric_column])
+
         df["מקור"] = self.source_name
         df["מזהה רשומה"] = df["Number"].apply(normalize_identifier)
 
+        run_date = anchor_date.date()
         calc_columns = []
         for _, row in df.iterrows():
             record_id = normalize_identifier(row["Number"])
-            open_date = safe_datetime(row.get("Open", ""), dayfirst=True)
-            start_date = safe_datetime(row.get("Start", ""), dayfirst=True)
+            open_date = row["Open"].to_pydatetime() if pd.notna(row["Open"]) else None
+            start_date = row["Start"].to_pydatetime() if pd.notna(row["Start"]) else None
             if open_date is not None:
                 state[f"{self.source_name}:{record_id}"] = {"open_date": str(open_date)}
 
-            days_to_departure = (start_date - anchor_date).days if start_date else ""
-            days_since_refund = (anchor_date - open_date).days if open_date else 0
+            start_date_only = start_date.date() if start_date is not None else None
+            days_to_departure = (
+                int((start_date_only - run_date).days) if start_date_only is not None else None
+            )
+            days_since_refund = (anchor_date - open_date).days if open_date is not None else 0
 
-            raw_refund = safe_text(row.get("Ref wl", "")).replace(",", "")
-            try:
-                refund_value = float(raw_refund) if raw_refund else 0.0
-            except ValueError:
-                refund_value = 0.0
+            refund_value = row.get("Ref wl", 0)
+            refund_value = 0.0 if pd.isna(refund_value) else float(refund_value)
 
             refund_note = ""
             if refund_value != 0:
                 refund_note = "החזר שטרם אושר מעל 60 יום" if days_since_refund > 60 else "החזר שטרם אושר"
+
+            is_private = not safe_text(row.get("C.Client", ""))
+            alert_category, email_body, email_target, alert_reason = build_alert_fields(
+                days_to_departure, is_private
+            )
 
             client_text = safe_text(row.get("C.Client", ""))
             has_invoice_gap = bool(client_text)
@@ -379,6 +491,12 @@ class GilboaProcessor(BaseVoucherProcessor):
                     system_note,
                     hist.get("הערות סוכן", ""),
                     hist.get("תאריך עידכון הערת סוכן", ""),
+                    alert_category,
+                    email_body,
+                    email_target,
+                    alert_reason,
+                    "",
+                    "",
                 ]
             )
 
@@ -389,10 +507,31 @@ class GilboaProcessor(BaseVoucherProcessor):
                 "הערות",
                 "הערות סוכן",
                 "תאריך עידכון הערת סוכן",
+                "קטגוריית התראה",
+                "גוף דוא״ל",
+                "email_target",
+                "סיבת התראה",
+                "email_employee",
+                "email_direct_manager",
             ]
         ] = pd.DataFrame(calc_columns, index=df.index)
+        df["email_department_manager"] = ""
 
-        preferred = [
+        added_columns = [
+            "מס' ימים ליציאה",
+            "מס' ימי החזר",
+            "הערות",
+            "הערות סוכן",
+            "תאריך עידכון הערת סוכן",
+            "קטגוריית התראה",
+            "סיבת התראה",
+            "גוף דוא״ל",
+            "email_target",
+            "email_employee",
+            "email_direct_manager",
+            "email_department_manager",
+        ]
+        leading_columns = [
             "מקור",
             "מזהה רשומה",
             "Number",
@@ -400,14 +539,11 @@ class GilboaProcessor(BaseVoucherProcessor):
             "Start",
             "Ref wl",
             "C.Client",
-            "מס' ימים ליציאה",
-            "מס' ימי החזר",
-            "הערות",
-            "הערות סוכן",
-            "תאריך עידכון הערת סוכן",
         ]
-        other_columns = [column for column in df.columns if column not in preferred]
-        return df[preferred + other_columns]
+        middle_columns = [
+            column for column in df.columns if column not in leading_columns and column not in added_columns
+        ]
+        return df[leading_columns + middle_columns + added_columns]
 
 
 class ProcessWorker(QObject):
@@ -434,13 +570,13 @@ class ProcessWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.thread: Optional[QThread] = None
+        self.worker_thread: Optional[QThread] = None
         self.worker: Optional[ProcessWorker] = None
         self.output_dir = ""
 
         self.setWindowTitle(APP_TITLE)
         self.resize(950, 680)
-        self.setLayoutDirection(Qt.RightToLeft)
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -530,32 +666,32 @@ class MainWindow(QMainWindow):
         self.status_label.setText("מצב: מעבד..." if is_busy else "מצב: מוכן")
 
     def start_worker(self, processor_cls, input_path: str, output_dir: str) -> None:
-        if self.thread is not None and self.thread.isRunning():
+        if self.worker_thread is not None and self.worker_thread.isRunning():
             QMessageBox.information(self, APP_TITLE, "כבר מתבצע עיבוד, יש להמתין לסיום")
             return
 
         self.set_busy(True)
-        self.thread = QThread(self)
+        self.worker_thread = QThread(self)
         self.worker = ProcessWorker(processor_cls, input_path, output_dir)
-        self.worker.moveToThread(self.thread)
+        self.worker.moveToThread(self.worker_thread)
 
-        self.thread.started.connect(self.worker.run)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_finished)
         self.worker.error.connect(self.on_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.error.connect(self.thread.quit)
-        self.thread.finished.connect(self.cleanup_thread)
-        self.thread.start()
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.error.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.cleanup_thread)
+        self.worker_thread.start()
 
     def cleanup_thread(self) -> None:
         self.set_busy(False)
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
-        if self.thread is not None:
-            self.thread.deleteLater()
-            self.thread = None
+        if self.worker_thread is not None:
+            self.worker_thread.deleteLater()
+            self.worker_thread = None
 
     def on_finished(self, output_path: str) -> None:
         self.append_log("העיבוד הסתיים בהצלחה")
