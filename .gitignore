@@ -1,15 +1,28 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Temp / editor
 *.log
 *.tmp
 *.bak
 *.swp
-*.csv
-*.xlsx
-voucher_state.json
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Output data files (generated at runtime)
+*.csv
+*.xlsx
+*.msg
+
+# Runtime state & user config (contain local paths)
+voucher_state.json
+agents_config.json
+
+# Output folders
+OUTPUT_*/
+ממתינות מייל - כתובת חסרה/
