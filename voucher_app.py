@@ -198,6 +198,7 @@ def create_outlook_draft(
     html_body: str,
     *,
     subfolder_name: str = "",
+    save_as_path: str = "",
     attachments: list[str] | None = None,
 ) -> None:
     try:
@@ -214,15 +215,18 @@ def create_outlook_draft(
     if attachments:
         for att_path in attachments:
             mail.Attachments.Add(att_path)
-    mail.Save()
-    if subfolder_name:
-        namespace = outlook.GetNamespace("MAPI")
-        drafts = namespace.GetDefaultFolder(16)
-        try:
-            target_folder = drafts.Folders[subfolder_name]
-        except Exception:
-            target_folder = drafts.Folders.Add(subfolder_name)
-        mail.Move(target_folder)
+    if save_as_path:
+        mail.SaveAs(save_as_path, 3)  # 3 = olMSG
+    else:
+        mail.Save()
+        if subfolder_name:
+            namespace = outlook.GetNamespace("MAPI")
+            drafts = namespace.GetDefaultFolder(16)
+            try:
+                target_folder = drafts.Folders[subfolder_name]
+            except Exception:
+                target_folder = drafts.Folders.Add(subfolder_name)
+            mail.Move(target_folder)
 
 
 def _save_df_excel(df: pd.DataFrame, path: str) -> None:
@@ -315,7 +319,9 @@ def prepare_agent_emails(
             pass
 
     if not unmatched_df.empty:
-        logger(f"נמצאו {len(unmatched_df)} רשומות ללא כתובת מייל — יוצר טיוטות בתיקייה '{_UNMATCHED_SUBFOLDER}'")
+        unmatched_out_dir = os.path.join(output_dir, _UNMATCHED_SUBFOLDER)
+        os.makedirs(unmatched_out_dir, exist_ok=True)
+        logger(f"נמצאו {len(unmatched_df)} רשומות ללא כתובת מייל — שומר קבצי מייל בתיקייה '{_UNMATCHED_SUBFOLDER}'")
         display_routing_exclude = _ROUTING_COLS | {"_agent_key"}
         for agent_key, grp in unmatched_df.groupby("_agent_key"):
             agent_key_str = safe_text(agent_key)
@@ -354,8 +360,11 @@ def prepare_agent_emails(
             html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
 
             subject = f"דוח בקרה וואוצרים \u2014 {agent_key_str} \u2014 {today_str} [חסרה כתובת מייל]"
-            create_outlook_draft("", [], subject, html_body, subfolder_name=_UNMATCHED_SUBFOLDER, attachments=tmp_files)
-            logger(f"טיוטה ללא מייל עבור: {agent_key_str} ← שמורה ב-'{_UNMATCHED_SUBFOLDER}'")
+            safe_key = agent_key_str.replace("/", "-").replace("\\", "-")
+            msg_path = os.path.join(unmatched_out_dir, f"דוח {safe_key} {today_str.replace('/', '.')}.msg")
+            _UNMATCHED_CC = ["ilanit_b@ophirtours.co.il", "YWaksman@mycwt.co.il"]
+            create_outlook_draft("", _UNMATCHED_CC, subject, html_body, save_as_path=msg_path, attachments=tmp_files)
+            logger(f"קובץ מייל נשמר: {os.path.basename(msg_path)}")
             count += 1
             for p in tmp_files:
                 try:
@@ -903,10 +912,12 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(16)
         title_font.setBold(True)
         title_label.setFont(title_font)
+        title_label.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         title_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(title_label)
 
         subtitle = QLabel("בחירת תיקיית פלט, ולאחר מכן טעינת קובץ BOOSTER או GILBOA")
+        subtitle.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         subtitle.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(subtitle)
 
