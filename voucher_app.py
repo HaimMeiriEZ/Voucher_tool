@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
@@ -28,7 +29,10 @@ from PySide6.QtWidgets import (
 
 APP_TITLE = "כלי ניהול ובקרת וואצ'רים"
 STATE_FILE_NAME = "voucher_state.json"
+AGENTS_CONFIG_FILE_NAME = "agents_config.json"
 NOTE_COLUMNS = ["הערות", "הערות סוכן", "תאריך עידכון הערת סוכן"]
+AGENT_REQUIRED_COLUMNS = ["משתמש בגלבוע", "סניף", "מייל", "מנהל סניף", "מנהל תחום", "מייל יפה", "מייל אילנית"]
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class ProcessingError(Exception):
@@ -88,6 +92,282 @@ def clean_numeric_series(series: pd.Series) -> pd.Series:
     cleaned = cleaned.replace("nan", pd.NA)
     cleaned = cleaned.replace("None", pd.NA)
     return pd.to_numeric(cleaned, errors="coerce")
+
+
+def load_agents_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_agents_config(config_path: str, data: dict) -> None:
+    with open(config_path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+
+
+def find_latest_output_file(output_dir: str, source_name: str) -> Optional[str]:
+    if not output_dir or not os.path.exists(output_dir):
+        return None
+    candidates = [
+        path
+        for path in glob.glob(os.path.join(output_dir, "*.xlsx"))
+        if not os.path.basename(path).startswith("~$")
+        and source_name.lower() in os.path.basename(path).lower()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def load_agent_table(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=0)
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in AGENT_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ProcessingError("עמודות חסרות בטבלת סוכנים: " + ", ".join(missing))
+    df["משתמש בגלבוע"] = df["משתמש בגלבוע"].astype(str).str.strip()
+    return df
+
+
+def build_agent_rows_map(
+    output_dir: str,
+    agent_df: pd.DataFrame,
+    logger: Callable[[str], None],
+) -> tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    agent_lookup = agent_df[AGENT_REQUIRED_COLUMNS].copy()
+    agent_lookup["_join_key"] = agent_lookup["משתמש בגלבוע"].str.strip()
+    matched_keys = set(agent_lookup["_join_key"])
+    frames = []
+    unmatched_frames = []
+
+    booster_file = find_latest_output_file(output_dir, "BOOSTER")
+    if booster_file:
+        logger(f"טוען BOOSTER: {os.path.basename(booster_file)}")
+        try:
+            b_df = pd.read_excel(booster_file, sheet_name="דוח מלא")
+            if "User" in b_df.columns:
+                b_df = b_df.copy()
+                b_df["_join_key"] = b_df["User"].astype(str).str.strip()
+                matched = b_df.merge(agent_lookup, on="_join_key", how="inner")
+                matched = matched.drop(columns=["_join_key"])
+                frames.append(matched)
+                unmatched_b = b_df[~b_df["_join_key"].isin(matched_keys)].copy()
+                unmatched_b = unmatched_b.rename(columns={"_join_key": "_agent_key"})
+                if not unmatched_b.empty:
+                    unmatched_frames.append(unmatched_b)
+        except Exception as exc:
+            logger(f"שגיאה בטעינת BOOSTER: {exc}")
+
+    gilboa_file = find_latest_output_file(output_dir, "GILBOA")
+    if gilboa_file:
+        logger(f"טוען GILBOA: {os.path.basename(gilboa_file)}")
+        try:
+            g_df = pd.read_excel(gilboa_file, sheet_name="דוח מלא")
+            if "Clerk" in g_df.columns:
+                g_df = g_df.copy()
+                g_df["_join_key"] = g_df["Clerk"].astype(str).str.strip()
+                matched = g_df.merge(agent_lookup, on="_join_key", how="inner")
+                matched = matched.drop(columns=["_join_key"])
+                frames.append(matched)
+                unmatched_g = g_df[~g_df["_join_key"].isin(matched_keys)].copy()
+                unmatched_g = unmatched_g.rename(columns={"_join_key": "_agent_key"})
+                if not unmatched_g.empty:
+                    unmatched_frames.append(unmatched_g)
+        except Exception as exc:
+            logger(f"שגיאה בטעינת GILBOA: {exc}")
+
+    if not frames and not unmatched_frames:
+        raise ProcessingError("לא נמצאו נתונים לשיוך בקבצי BOOSTER/GILBOA בתיקיית הפלט")
+
+    result: Dict[str, pd.DataFrame] = {}
+    if frames:
+        combined = pd.concat(frames, ignore_index=True)
+        for email_addr, group in combined.groupby("מייל"):
+            email_str = safe_text(email_addr)
+            if email_str:
+                result[email_str] = group.reset_index(drop=True)
+    unmatched_combined = pd.concat(unmatched_frames, ignore_index=True) if unmatched_frames else pd.DataFrame()
+    return result, unmatched_combined
+
+
+def create_outlook_draft(
+    to_email: str,
+    cc_emails: list[str],
+    subject: str,
+    html_body: str,
+    *,
+    subfolder_name: str = "",
+    attachments: list[str] | None = None,
+) -> None:
+    try:
+        import win32com.client
+    except ImportError as exc:
+        raise ProcessingError("חבילת pywin32 אינה מותקנת. הרץ: pip install pywin32") from exc
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+    mail.To = to_email
+    if cc_emails:
+        mail.CC = "; ".join(cc_emails)
+    mail.Subject = subject
+    mail.HTMLBody = html_body
+    if attachments:
+        for att_path in attachments:
+            mail.Attachments.Add(att_path)
+    mail.Save()
+    if subfolder_name:
+        namespace = outlook.GetNamespace("MAPI")
+        drafts = namespace.GetDefaultFolder(16)
+        try:
+            target_folder = drafts.Folders[subfolder_name]
+        except Exception:
+            target_folder = drafts.Folders.Add(subfolder_name)
+        mail.Move(target_folder)
+
+
+def _save_df_excel(df: pd.DataFrame, path: str) -> None:
+    """Write df to Excel. If multiple sources (מקור column) exist each gets its own sheet
+    with only the columns that have at least one non-empty value in that group."""
+    def _drop_empty_cols(frame: pd.DataFrame) -> pd.DataFrame:
+        def has_value(col):
+            return col.apply(lambda v: pd.notna(v) and str(v).strip() not in ("", "nan", "None", "NaT")).any()
+        return frame.loc[:, frame.apply(has_value)]
+
+    if "מקור" in df.columns and df["מקור"].nunique() > 1:
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            for source, group in df.groupby("מקור"):
+                _drop_empty_cols(group.reset_index(drop=True)).to_excel(writer, sheet_name=str(source), index=False)
+    else:
+        _drop_empty_cols(df.reset_index(drop=True)).to_excel(path, index=False, engine="openpyxl")
+
+
+def prepare_agent_emails(
+    output_dir: str,
+    agent_table_path: str,
+    logger: Callable[[str], None],
+) -> int:
+    _ROUTING_COLS = set(AGENT_REQUIRED_COLUMNS) | {
+        "email_target", "email_employee", "email_direct_manager", "email_department_manager",
+        "גוף דוא\u05f4ל",
+    }
+    _UNMATCHED_SUBFOLDER = "ממתינות מייל - כתובת חסרה"
+    agent_df = load_agent_table(agent_table_path)
+    rows_map, unmatched_df = build_agent_rows_map(output_dir, agent_df, logger)
+
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    cc_source_columns = ["מנהל סניף", "מנהל תחום", "מייל יפה", "מייל אילנית"]
+    count = 0
+    for to_email, rows_df in rows_map.items():
+        agent_name = safe_text(rows_df["משתמש בגלבוע"].iloc[0]) if "משתמש בגלבוע" in rows_df.columns else to_email
+        cc_emails = []
+        for col in cc_source_columns:
+            if col in rows_df.columns:
+                val = safe_text(rows_df[col].iloc[0])
+                if val and val != to_email and val not in cc_emails:
+                    cc_emails.append(val)
+
+        display_cols = [c for c in rows_df.columns if c not in _ROUTING_COLS]
+        cat_col = "email_target" if "email_target" in rows_df.columns else None
+        df_all = rows_df[display_cols]
+        df_warning = rows_df[rows_df[cat_col] == "התראה שבועיים לפני היציאה"][display_cols] if cat_col else pd.DataFrame()
+        df_cancel = rows_df[rows_df[cat_col] == "עלול להתבטל"][display_cols] if cat_col else pd.DataFrame()
+        count_all = len(df_all)
+        count_warning = len(df_warning)
+        count_cancel = len(df_cancel)
+
+        tmp_dir = tempfile.mkdtemp()
+        tmp_files = []
+        all_path = os.path.join(tmp_dir, f"הזמנות פתוחות - {agent_name}.xlsx")
+        _save_df_excel(df_all, all_path)
+        tmp_files.append(all_path)
+        if not df_warning.empty:
+            warn_path = os.path.join(tmp_dir, f"הזמנות שבועיים לפני יציאה - {agent_name}.xlsx")
+            _save_df_excel(df_warning, warn_path)
+            tmp_files.append(warn_path)
+        if not df_cancel.empty:
+            cancel_path = os.path.join(tmp_dir, f"הזמנות עלולות להתבטל - {agent_name}.xlsx")
+            _save_df_excel(df_cancel, cancel_path)
+            tmp_files.append(cancel_path)
+
+        body_lines = [
+            "<p>שלום,</p>",
+            "<p>להלן סיכום ההזמנות הפתוחות עבורך (הפרטים המלאים מצורפים כקבצי אקסל):</p>",
+            f"<p>&#128196; <strong>הזמנות פתוחות:</strong> {count_all} רשומות</p>",
+        ]
+        if count_warning:
+            body_lines.append(f"<p>&#9888; <strong>הזמנות שבועיים לפני היציאה:</strong> {count_warning} רשומות</p>")
+        if count_cancel:
+            body_lines.append(f"<p>&#128308; <strong>הזמנות עלולות להתבטל עד סוף היום:</strong> {count_cancel} רשומות</p>")
+        html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
+
+        subject = f"דוח בקרה וואוצרים \u2014 {agent_name} \u2014 {today_str}"
+        create_outlook_draft(to_email, cc_emails, subject, html_body, attachments=tmp_files)
+        logger(f"נוצרה טיוטה עבור: {agent_name} ({to_email})")
+        count += 1
+        for p in tmp_files:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+
+    if not unmatched_df.empty:
+        logger(f"נמצאו {len(unmatched_df)} רשומות ללא כתובת מייל — יוצר טיוטות בתיקייה '{_UNMATCHED_SUBFOLDER}'")
+        display_routing_exclude = _ROUTING_COLS | {"_agent_key"}
+        for agent_key, grp in unmatched_df.groupby("_agent_key"):
+            agent_key_str = safe_text(agent_key)
+            display_cols = [c for c in grp.columns if c not in display_routing_exclude]
+            cat_col = "email_target" if "email_target" in grp.columns else None
+            df_all = grp[display_cols]
+            df_warning = grp[grp[cat_col] == "התראה שבועיים לפני היציאה"][display_cols] if cat_col else pd.DataFrame()
+            df_cancel = grp[grp[cat_col] == "עלול להתבטל"][display_cols] if cat_col else pd.DataFrame()
+            count_all = len(df_all)
+            count_warning = len(df_warning)
+            count_cancel = len(df_cancel)
+
+            tmp_dir = tempfile.mkdtemp()
+            tmp_files = []
+            all_path = os.path.join(tmp_dir, f"הזמנות פתוחות - {agent_key_str}.xlsx")
+            _save_df_excel(df_all, all_path)
+            tmp_files.append(all_path)
+            if not df_warning.empty:
+                warn_path = os.path.join(tmp_dir, f"הזמנות שבועיים לפני יציאה - {agent_key_str}.xlsx")
+                _save_df_excel(df_warning, warn_path)
+                tmp_files.append(warn_path)
+            if not df_cancel.empty:
+                cancel_path = os.path.join(tmp_dir, f"הזמנות עלולות להתבטל - {agent_key_str}.xlsx")
+                _save_df_excel(df_cancel, cancel_path)
+                tmp_files.append(cancel_path)
+
+            body_lines = [
+                f"<p style=\"color:#e11d48;\"><strong>&#9888; לא נמצאה כתובת מייל עבור סוכן: {agent_key_str}</strong></p>",
+                "<p>יש להוסיף את כתובת המייל ידנית לפני שליחה.</p>",
+                f"<p>&#128196; <strong>הזמנות פתוחות:</strong> {count_all} רשומות</p>",
+            ]
+            if count_warning:
+                body_lines.append(f"<p>&#9888; <strong>הזמנות שבועיים לפני היציאה:</strong> {count_warning} רשומות</p>")
+            if count_cancel:
+                body_lines.append(f"<p>&#128308; <strong>הזמנות עלולות להתבטל עד סוף היום:</strong> {count_cancel} רשומות</p>")
+            html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
+
+            subject = f"דוח בקרה וואוצרים \u2014 {agent_key_str} \u2014 {today_str} [חסרה כתובת מייל]"
+            create_outlook_draft("", [], subject, html_body, subfolder_name=_UNMATCHED_SUBFOLDER, attachments=tmp_files)
+            logger(f"טיוטה ללא מייל עבור: {agent_key_str} ← שמורה ב-'{_UNMATCHED_SUBFOLDER}'")
+            count += 1
+            for p in tmp_files:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+    return count
 
 
 class BaseVoucherProcessor:
@@ -200,7 +480,7 @@ class BaseVoucherProcessor:
             if not warning_14.empty:
                 warning_14.to_excel(writer, sheet_name="אזהרה שבועיים", index=False)
             if not threat_7.empty:
-                threat_7.to_excel(writer, sheet_name="איום שבוע", index=False)
+                threat_7.to_excel(writer, sheet_name="עלול להתבטל", index=False)
 
         workbook = load_workbook(output_path)
         date_columns = {"Open", "Start", "Start Date", "End Date", "תאריך עידכון הערת סוכן"}
@@ -308,6 +588,7 @@ class BoosterProcessor(BaseVoucherProcessor):
         anchor_date: datetime,
     ) -> pd.DataFrame:
         df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce")
+        df["User"] = df["User"].astype(str).str.strip()
         df["מקור"] = self.source_name
         df["מזהה רשומה"] = df["T. File No."].apply(normalize_identifier)
 
@@ -423,7 +704,7 @@ class GilboaProcessor(BaseVoucherProcessor):
                 )
                 df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
                 df.columns = [str(column).strip() for column in df.columns]
-                self.ensure_columns(df, ["Number", "Open", "Start", "Ref wl", "C.Client"])
+                self.ensure_columns(df, ["Number", "Open", "Start", "Ref wl", "C.Client", "Clerk"])
                 return df
             except Exception as error:
                 read_errors.append(str(error))
@@ -439,6 +720,7 @@ class GilboaProcessor(BaseVoucherProcessor):
     ) -> pd.DataFrame:
         df["Open"] = pd.to_datetime(df["Open"], format="%d/%m/%Y", errors="coerce")
         df["Start"] = pd.to_datetime(df["Start"], format="%d/%m/%Y", errors="coerce")
+        df["Clerk"] = df["Clerk"].astype(str).str.strip()
 
         for numeric_column in ["Number", "Ref wl", "Attr", "Credit", "Balance"]:
             if numeric_column in df.columns:
@@ -539,6 +821,7 @@ class GilboaProcessor(BaseVoucherProcessor):
             "Start",
             "Ref wl",
             "C.Client",
+            "Clerk",
         ]
         middle_columns = [
             column for column in df.columns if column not in leading_columns and column not in added_columns
@@ -567,12 +850,43 @@ class ProcessWorker(QObject):
             self.error.emit(str(error))
 
 
+class EmailWorker(QObject):
+    finished = Signal(int)
+    error = Signal(str)
+    log_message = Signal(str)
+
+    def __init__(self, output_dir: str, agent_table_path: str):
+        super().__init__()
+        self.output_dir = output_dir
+        self.agent_table_path = agent_table_path
+
+    @Slot()
+    def run(self) -> None:
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            count = prepare_agent_emails(self.output_dir, self.agent_table_path, self.log_message.emit)
+            self.finished.emit(count)
+        except Exception as error:
+            self.error.emit(str(error))
+        finally:
+            pythoncom.CoUninitialize()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[ProcessWorker] = None
+        self.email_worker_thread: Optional[QThread] = None
+        self.email_worker: Optional[EmailWorker] = None
         self.output_dir = ""
+        self.agent_table_path = ""
+
+        _config = load_agents_config(os.path.join(_APP_DIR, AGENTS_CONFIG_FILE_NAME))
+        _saved = _config.get("agent_table_path", "")
+        if _saved and os.path.exists(_saved):
+            self.agent_table_path = _saved
 
         self.setWindowTitle(APP_TITLE)
         self.resize(950, 680)
@@ -589,38 +903,63 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(16)
         title_font.setBold(True)
         title_label.setFont(title_font)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(title_label)
 
         subtitle = QLabel("בחירת תיקיית פלט, ולאחר מכן טעינת קובץ BOOSTER או GILBOA")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(subtitle)
 
         path_layout = QHBoxLayout()
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setPlaceholderText("בחר תיקיית פלט לשמירת הדוחות וההיסטוריה")
+        self.output_path_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         browse_button = QPushButton("בחר תיקיית פלט")
         browse_button.clicked.connect(self.choose_output_dir)
-        path_layout.addWidget(self.output_path_edit)
         path_layout.addWidget(browse_button)
+        path_layout.addWidget(self.output_path_edit)
         layout.addLayout(path_layout)
+
+        agent_layout = QHBoxLayout()
+        self.agent_path_edit = QLineEdit()
+        self.agent_path_edit.setReadOnly(True)
+        self.agent_path_edit.setPlaceholderText("טבלת סוכנים לא נטענה")
+        self.agent_path_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.agent_path_edit.setStyleSheet(
+            "background: #f0f4f8; color: #334155; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px;"
+        )
+        if self.agent_table_path:
+            self.agent_path_edit.setText(self.agent_table_path)
+        agent_browse_button = QPushButton("קליטת טבלת סוכנים")
+        agent_browse_button.clicked.connect(self.choose_agent_table)
+        agent_layout.addWidget(agent_browse_button)
+        agent_layout.addWidget(self.agent_path_edit, stretch=1)
+        layout.addLayout(agent_layout)
 
         buttons_layout = QHBoxLayout()
         self.booster_button = QPushButton("קליטת קובץ BOOSTER")
         self.gilboa_button = QPushButton("קליטת קובץ GILBOA")
+        self.email_button = QPushButton("הכנת מיילים לסוכנים")
         self.booster_button.clicked.connect(lambda: self.select_and_run(BoosterProcessor, "קבצי Excel (*.xlsx *.xls)"))
         self.gilboa_button.clicked.connect(lambda: self.select_and_run(GilboaProcessor, "קבצי טקסט (*.txt)"))
+        self.email_button.clicked.connect(self.start_email_worker)
         buttons_layout.addWidget(self.booster_button)
         buttons_layout.addWidget(self.gilboa_button)
+        buttons_layout.addWidget(self.email_button)
         layout.addLayout(buttons_layout)
 
         self.status_label = QLabel("מצב: מוכן")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.status_label)
 
         log_title = QLabel("לוג פעילות")
         log_title.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        log_title.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(log_title)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.log_view.setStyleSheet(
             "background-color: #10151c; color: #d8e2f0; border: 1px solid #2b3a4f;"
             "font-family: Consolas, 'Courier New', monospace; font-size: 12px;"
@@ -634,6 +973,8 @@ class MainWindow(QMainWindow):
             "QLineEdit { background: white; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; }"
         )
 
+        if self.agent_table_path:
+            self.append_log(f"טבלת סוכנים נטענה אוטומטית: {self.agent_table_path}")
         self.append_log("המערכת מוכנה לעבודה")
 
     def append_log(self, message: str) -> None:
@@ -663,6 +1004,7 @@ class MainWindow(QMainWindow):
     def set_busy(self, is_busy: bool) -> None:
         self.booster_button.setDisabled(is_busy)
         self.gilboa_button.setDisabled(is_busy)
+        self.email_button.setDisabled(is_busy)
         self.status_label.setText("מצב: מעבד..." if is_busy else "מצב: מוכן")
 
     def start_worker(self, processor_cls, input_path: str, output_dir: str) -> None:
@@ -700,6 +1042,66 @@ class MainWindow(QMainWindow):
 
     def on_error(self, error_message: str) -> None:
         self.append_log(f"שגיאה: {error_message}")
+        QMessageBox.critical(self, APP_TITLE, error_message)
+
+    def choose_agent_table(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "בחר קובץ טבלת סוכנים", "", "קבצי Excel (*.xlsx *.xls)"
+        )
+        if not file_path:
+            return
+        try:
+            load_agent_table(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, APP_TITLE, f"שגיאה בטעינת טבלת סוכנים:\n{exc}")
+            return
+        self.agent_table_path = file_path
+        self.agent_path_edit.setText(file_path)
+        save_agents_config(
+            os.path.join(_APP_DIR, AGENTS_CONFIG_FILE_NAME),
+            {"agent_table_path": file_path},
+        )
+        self.append_log(f"טבלת סוכנים נטענה: {os.path.basename(file_path)}")
+
+    def start_email_worker(self) -> None:
+        output_dir = self.output_path_edit.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, APP_TITLE, "יש לבחור תיקיית פלט לפני הכנת המיילים")
+            return
+        if not self.agent_table_path:
+            QMessageBox.warning(self, APP_TITLE, "יש לטעון טבלת סוכנים לפני הכנת המיילים")
+            return
+        if self.email_worker_thread is not None and self.email_worker_thread.isRunning():
+            QMessageBox.information(self, APP_TITLE, "כבר מתבצעת הכנת מיילים, יש להמתין לסיום")
+            return
+        self.set_busy(True)
+        self.email_worker_thread = QThread(self)
+        self.email_worker = EmailWorker(output_dir, self.agent_table_path)
+        self.email_worker.moveToThread(self.email_worker_thread)
+        self.email_worker_thread.started.connect(self.email_worker.run)
+        self.email_worker.log_message.connect(self.append_log)
+        self.email_worker.finished.connect(self.on_emails_finished)
+        self.email_worker.error.connect(self.on_email_error)
+        self.email_worker.finished.connect(self.email_worker_thread.quit)
+        self.email_worker.error.connect(self.email_worker_thread.quit)
+        self.email_worker_thread.finished.connect(self.cleanup_email_thread)
+        self.email_worker_thread.start()
+
+    def cleanup_email_thread(self) -> None:
+        self.set_busy(False)
+        if self.email_worker is not None:
+            self.email_worker.deleteLater()
+            self.email_worker = None
+        if self.email_worker_thread is not None:
+            self.email_worker_thread.deleteLater()
+            self.email_worker_thread = None
+
+    def on_emails_finished(self, count: int) -> None:
+        self.append_log(f"הכנת מיילים הסתיימה — נוצרו {count} טיוטות")
+        QMessageBox.information(self, APP_TITLE, f"נוצרו {count} טיוטות מייל ב-Outlook")
+
+    def on_email_error(self, error_message: str) -> None:
+        self.append_log(f"שגיאה בהכנת מיילים: {error_message}")
         QMessageBox.critical(self, APP_TITLE, error_message)
 
 
