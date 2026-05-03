@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 import sys
@@ -33,6 +34,17 @@ AGENTS_CONFIG_FILE_NAME = "agents_config.json"
 NOTE_COLUMNS = ["הערות", "הערות סוכן", "תאריך עידכון הערת סוכן"]
 AGENT_REQUIRED_COLUMNS = ["משתמש בגלבוע", "סניף", "מייל", "מנהל סניף", "מנהל תחום", "מייל יפה", "מייל אילנית"]
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# File logger — writes to voucher_tool.log next to the script
+_LOG_FILE = os.path.join(_APP_DIR, "voucher_tool.log")
+logging.basicConfig(
+    filename=_LOG_FILE,
+    level=logging.DEBUG,
+    encoding="utf-8",
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_logger = logging.getLogger("voucher_tool")
 
 
 class ProcessingError(Exception):
@@ -991,6 +1003,7 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.append(f"[{timestamp}] {message}")
+        _logger.info(message)
 
     def choose_output_dir(self) -> None:
         selected_dir = QFileDialog.getExistingDirectory(self, "בחר תיקיית פלט")
@@ -1053,6 +1066,7 @@ class MainWindow(QMainWindow):
 
     def on_error(self, error_message: str) -> None:
         self.append_log(f"שגיאה: {error_message}")
+        _logger.error(error_message)
         QMessageBox.critical(self, APP_TITLE, error_message)
 
     def choose_agent_table(self) -> None:
@@ -1116,7 +1130,18 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, APP_TITLE, error_message)
 
 
+def _handle_uncaught_exception(exc_type, exc_value, exc_tb):
+    """Log unhandled exceptions to file before the process exits."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    _logger.critical("קריסה לא מטופלת", exc_info=(exc_type, exc_value, exc_tb))
+
+
 def main() -> None:
+    sys.excepthook = _handle_uncaught_exception
+    _logger.info("=" * 60)
+    _logger.info("הפעלת הכלי")
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
