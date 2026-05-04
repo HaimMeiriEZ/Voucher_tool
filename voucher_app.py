@@ -17,6 +17,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -850,6 +851,81 @@ class GilboaProcessor(BaseVoucherProcessor):
         return df[leading_columns + middle_columns + added_columns]
 
 
+class StatCard(QFrame):
+    """Small summary card showing a count and a label."""
+
+    _STYLE_MATCHED = (
+        "QFrame { background: #dcfce7; border: 1.5px solid #16a34a; border-radius: 10px; }"
+    )
+    _STYLE_UNMATCHED = (
+        "QFrame { background: #fff7ed; border: 1.5px solid #ea580c; border-radius: 10px; }"
+    )
+    _STYLE_IDLE = (
+        "QFrame { background: #f1f5f9; border: 1.5px solid #cbd5e1; border-radius: 10px; }"
+    )
+
+    def __init__(self, variant: str, parent=None):
+        super().__init__(parent)
+        self._variant = variant  # "matched" | "unmatched"
+        self.setMinimumHeight(72)
+
+        inner = QVBoxLayout(self)
+        inner.setContentsMargins(14, 8, 14, 8)
+        inner.setSpacing(2)
+
+        self._number_label = QLabel("—")
+        num_font = QFont("Arial", 26, QFont.Weight.Bold)
+        self._number_label.setFont(num_font)
+        self._number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._title_label = QLabel()
+        title_font = QFont("Arial", 9)
+        self._title_label.setFont(title_font)
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._sub_label = QLabel()
+        sub_font = QFont("Arial", 8)
+        self._sub_label.setFont(sub_font)
+        self._sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        inner.addWidget(self._number_label)
+        inner.addWidget(self._title_label)
+        inner.addWidget(self._sub_label)
+
+        self._set_idle()
+
+    def _set_idle(self) -> None:
+        self.setStyleSheet(self._STYLE_IDLE)
+        self._number_label.setStyleSheet("color: #94a3b8;")
+        self._title_label.setStyleSheet("color: #94a3b8;")
+        self._sub_label.setStyleSheet("color: #94a3b8;")
+        self._number_label.setText("—")
+        self._title_label.setText(
+            "סוכנים ששויכו" if self._variant == "matched" else "ללא כתובת מייל"
+        )
+        self._sub_label.setText("")
+
+    def set_value(self, count: int, sub: str = "") -> None:
+        if self._variant == "matched":
+            self.setStyleSheet(self._STYLE_MATCHED)
+            self._number_label.setStyleSheet("color: #15803d;")
+            self._title_label.setStyleSheet("color: #166534;")
+            self._sub_label.setStyleSheet("color: #166534;")
+            self._title_label.setText("סוכנים ששויכו")
+        else:
+            self.setStyleSheet(self._STYLE_UNMATCHED if count > 0 else self._STYLE_IDLE)
+            color = "#c2410c" if count > 0 else "#94a3b8"
+            self._number_label.setStyleSheet(f"color: {color};")
+            self._title_label.setStyleSheet(f"color: {color};")
+            self._sub_label.setStyleSheet(f"color: {color};")
+            self._title_label.setText("ללא כתובת מייל")
+        self._number_label.setText(str(count))
+        self._sub_label.setText(sub)
+
+    def reset(self) -> None:
+        self._set_idle()
+
+
 class ProcessWorker(QObject):
     finished = Signal(str)
     error = Signal(str)
@@ -925,13 +1001,25 @@ class MainWindow(QMainWindow):
         title_font.setBold(True)
         title_label.setFont(title_font)
         title_label.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(title_label)
+        title_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(
+            title_label,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
+        )
 
-        subtitle = QLabel("בחירת תיקיית פלט, ולאחר מכן טעינת קובץ BOOSTER או GILBOA")
+        subtitle = QLabel(
+            "בחירת תיקיית פלט, ולאחר מכן טעינת קובץ \u2066BOOSTER\u2069 או \u2066GILBOA\u2069"
+        )
         subtitle.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(subtitle)
+        subtitle.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(
+            subtitle,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
+        )
 
         path_layout = QHBoxLayout()
         self.output_path_edit = QLineEdit()
@@ -960,25 +1048,62 @@ class MainWindow(QMainWindow):
         layout.addLayout(agent_layout)
 
         buttons_layout = QHBoxLayout()
-        self.booster_button = QPushButton("קליטת קובץ BOOSTER")
-        self.gilboa_button = QPushButton("קליטת קובץ GILBOA")
+        self.booster_button = QPushButton("קליטת קובץ בוסטר")
+        self.gilboa_button = QPushButton("קליטת קובץ גילבוע")
         self.email_button = QPushButton("הכנת מיילים לסוכנים")
         self.booster_button.clicked.connect(lambda: self.select_and_run(BoosterProcessor, "קבצי Excel (*.xlsx *.xls)"))
         self.gilboa_button.clicked.connect(lambda: self.select_and_run(GilboaProcessor, "קבצי טקסט (*.txt)"))
         self.email_button.clicked.connect(self.start_email_worker)
         buttons_layout.addWidget(self.booster_button)
         buttons_layout.addWidget(self.gilboa_button)
-        buttons_layout.addWidget(self.email_button)
         layout.addLayout(buttons_layout)
 
+        stats_title = QLabel("סיכום שיוך סוכנים לכתובות מייל")
+        stats_title.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        stats_title.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
+        )
+        stats_title_font = QFont("Arial", 9, QFont.Weight.Bold)
+        stats_title.setFont(stats_title_font)
+        stats_title.setStyleSheet("color: #475569;")
+        layout.addWidget(
+            stats_title,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
+        )
+
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(12)
+        self.stat_unmatched = StatCard("unmatched")
+        self.stat_matched = StatCard("matched")
+        stats_layout.addWidget(self.stat_unmatched)
+        stats_layout.addWidget(self.stat_matched)
+        layout.addLayout(stats_layout)
+
+        email_layout = QHBoxLayout()
+        email_layout.addWidget(self.email_button)
+        layout.addLayout(email_layout)
+
         self.status_label = QLabel("מצב: מוכן")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(self.status_label)
+        self.status_label.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.status_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.status_label.setMinimumWidth(140)
+        layout.addWidget(
+            self.status_label,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
+        )
 
         log_title = QLabel("לוג פעילות")
+        log_title.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         log_title.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        log_title.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(log_title)
+        log_title.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(
+            log_title,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
+        )
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -1062,6 +1187,7 @@ class MainWindow(QMainWindow):
     def on_finished(self, output_path: str) -> None:
         self.append_log("העיבוד הסתיים בהצלחה")
         self.append_log(f"קובץ הפלט: {output_path}")
+        self._refresh_stats()
         QMessageBox.information(self, APP_TITLE, f"הדוח נשמר בהצלחה:\n{output_path}")
 
     def on_error(self, error_message: str) -> None:
@@ -1087,6 +1213,26 @@ class MainWindow(QMainWindow):
             {"agent_table_path": file_path},
         )
         self.append_log(f"טבלת סוכנים נטענה: {os.path.basename(file_path)}")
+        self._refresh_stats()
+
+    def _refresh_stats(self) -> None:
+        output_dir = self.output_path_edit.text().strip()
+        if not output_dir or not self.agent_table_path:
+            self.stat_matched.reset()
+            self.stat_unmatched.reset()
+            return
+        try:
+            agent_df = load_agent_table(self.agent_table_path)
+            rows_map, unmatched_df = build_agent_rows_map(output_dir, agent_df, lambda _: None)
+        except Exception:
+            self.stat_matched.reset()
+            self.stat_unmatched.reset()
+            return
+        matched_agents = len(rows_map)
+        matched_records = sum(len(v) for v in rows_map.values())
+        unmatched_agents = unmatched_df["_agent_key"].nunique() if not unmatched_df.empty else 0
+        self.stat_matched.set_value(matched_agents, f"{matched_records} רשומות")
+        self.stat_unmatched.set_value(unmatched_agents)
 
     def start_email_worker(self) -> None:
         output_dir = self.output_path_edit.text().strip()
@@ -1143,6 +1289,7 @@ def main() -> None:
     _logger.info("=" * 60)
     _logger.info("הפעלת הכלי")
     app = QApplication(sys.argv)
+    app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
