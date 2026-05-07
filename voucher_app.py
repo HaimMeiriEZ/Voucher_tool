@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import glob
 import json
@@ -149,7 +149,7 @@ def build_agent_rows_map(
     logger: Callable[[str], None],
 ) -> tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
     agent_lookup = agent_df[AGENT_REQUIRED_COLUMNS].copy()
-    agent_lookup["_join_key"] = agent_lookup["משתמש בגלבוע"].str.strip()
+    agent_lookup["_join_key"] = agent_lookup["משתמש בגלבוע"].str.strip().str.upper()
     matched_keys = set(agent_lookup["_join_key"])
     frames = []
     unmatched_frames = []
@@ -161,7 +161,7 @@ def build_agent_rows_map(
             b_df = pd.read_excel(booster_file, sheet_name="דוח מלא")
             if "User" in b_df.columns:
                 b_df = b_df.copy()
-                b_df["_join_key"] = b_df["User"].astype(str).str.strip()
+                b_df["_join_key"] = b_df["User"].astype(str).str.strip().str.upper()
                 matched = b_df.merge(agent_lookup, on="_join_key", how="inner")
                 matched = matched.drop(columns=["_join_key"])
                 frames.append(matched)
@@ -179,7 +179,7 @@ def build_agent_rows_map(
             g_df = pd.read_excel(gilboa_file, sheet_name="דוח מלא")
             if "Clerk" in g_df.columns:
                 g_df = g_df.copy()
-                g_df["_join_key"] = g_df["Clerk"].astype(str).str.strip()
+                g_df["_join_key"] = g_df["Clerk"].astype(str).str.strip().str.upper()
                 matched = g_df.merge(agent_lookup, on="_join_key", how="inner")
                 matched = matched.drop(columns=["_join_key"])
                 frames.append(matched)
@@ -196,7 +196,13 @@ def build_agent_rows_map(
     result: Dict[str, pd.DataFrame] = {}
     if frames:
         combined = pd.concat(frames, ignore_index=True)
-        for email_addr, group in combined.groupby("מייל"):
+        no_email_mask = combined["מייל"].isna() | (combined["מייל"].astype(str).str.strip() == "")
+        no_email_df = combined[no_email_mask].copy()
+        if not no_email_df.empty:
+            agent_key_col = "משתמש בגלבוע" if "משתמש בגלבוע" in no_email_df.columns else "User"
+            no_email_df["_agent_key"] = no_email_df[agent_key_col].astype(str).str.strip().str.upper()
+            unmatched_frames.append(no_email_df)
+        for email_addr, group in combined[~no_email_mask].groupby("מייל"):
             email_str = safe_text(email_addr)
             if email_str:
                 result[email_str] = group.reset_index(drop=True)
@@ -264,7 +270,7 @@ def prepare_agent_emails(
     logger: Callable[[str], None],
 ) -> int:
     _ROUTING_COLS = set(AGENT_REQUIRED_COLUMNS) | {
-        "email_target", "email_employee", "email_direct_manager", "email_department_manager",
+        "email_target",
         "גוף דוא\u05f4ל",
     }
     _UNMATCHED_SUBFOLDER = "ממתינות מייל - כתובת חסרה"
@@ -289,8 +295,6 @@ def prepare_agent_emails(
         df_warning = rows_df[rows_df[cat_col] == "התראה שבועיים לפני היציאה"][display_cols] if cat_col else pd.DataFrame()
         df_cancel = rows_df[rows_df[cat_col] == "עלול להתבטל"][display_cols] if cat_col else pd.DataFrame()
         count_all = len(df_all)
-        count_warning = len(df_warning)
-        count_cancel = len(df_cancel)
 
         tmp_dir = tempfile.mkdtemp()
         tmp_files = []
@@ -306,6 +310,9 @@ def prepare_agent_emails(
             _save_df_excel(df_cancel, cancel_path)
             tmp_files.append(cancel_path)
 
+        count_warning = len(df_warning)
+        count_cancel = len(df_cancel)
+        _email_body_col = "גוף דוא״ל"
         body_lines = [
             "<p>שלום,</p>",
             "<p>להלן סיכום ההזמנות הפתוחות עבורך (הפרטים המלאים מצורפים כקבצי אקסל):</p>",
@@ -315,6 +322,15 @@ def prepare_agent_emails(
             body_lines.append(f"<p>&#9888; <strong>הזמנות שבועיים לפני היציאה:</strong> {count_warning} רשומות</p>")
         if count_cancel:
             body_lines.append(f"<p>&#128308; <strong>הזמנות עלולות להתבטל עד סוף היום:</strong> {count_cancel} רשומות</p>")
+        if _email_body_col in rows_df.columns:
+            body_counts = (
+                rows_df[_email_body_col]
+                .dropna()
+                .loc[lambda s: s.str.strip() != ""]
+                .value_counts()
+            )
+            for body_val, body_cnt in body_counts.items():
+                body_lines.append(f"<p>{body_val} ({body_cnt})</p>")
         html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
 
         subject = f"דוח בקרה וואוצרים \u2014 {agent_name} \u2014 {today_str}"
@@ -344,8 +360,6 @@ def prepare_agent_emails(
             df_warning = grp[grp[cat_col] == "התראה שבועיים לפני היציאה"][display_cols] if cat_col else pd.DataFrame()
             df_cancel = grp[grp[cat_col] == "עלול להתבטל"][display_cols] if cat_col else pd.DataFrame()
             count_all = len(df_all)
-            count_warning = len(df_warning)
-            count_cancel = len(df_cancel)
 
             tmp_dir = tempfile.mkdtemp()
             tmp_files = []
@@ -361,6 +375,9 @@ def prepare_agent_emails(
                 _save_df_excel(df_cancel, cancel_path)
                 tmp_files.append(cancel_path)
 
+            count_warning = len(df_warning)
+            count_cancel = len(df_cancel)
+            _email_body_col = "גוף דוא״ל"
             body_lines = [
                 f"<p style=\"color:#e11d48;\"><strong>&#9888; לא נמצאה כתובת מייל עבור סוכן: {agent_key_str}</strong></p>",
                 "<p>יש להוסיף את כתובת המייל ידנית לפני שליחה.</p>",
@@ -370,6 +387,15 @@ def prepare_agent_emails(
                 body_lines.append(f"<p>&#9888; <strong>הזמנות שבועיים לפני היציאה:</strong> {count_warning} רשומות</p>")
             if count_cancel:
                 body_lines.append(f"<p>&#128308; <strong>הזמנות עלולות להתבטל עד סוף היום:</strong> {count_cancel} רשומות</p>")
+            if _email_body_col in grp.columns:
+                body_counts = (
+                    grp[_email_body_col]
+                    .dropna()
+                    .loc[lambda s: s.str.strip() != ""]
+                    .value_counts()
+                )
+                for body_val, body_cnt in body_counts.items():
+                    body_lines.append(f"<p>{body_val} ({body_cnt})</p>")
             html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
 
             subject = f"דוח בקרה וואוצרים \u2014 {agent_key_str} \u2014 {today_str} [חסרה כתובת מייל]"
@@ -659,8 +685,6 @@ class BoosterProcessor(BaseVoucherProcessor):
                     email_body,
                     email_target,
                     alert_reason,
-                    "",
-                    "",
                 ]
             )
 
@@ -675,11 +699,8 @@ class BoosterProcessor(BaseVoucherProcessor):
                 "גוף דוא״ל",
                 "email_target",
                 "סיבת התראה",
-                "email_employee",
-                "email_direct_manager",
             ]
         ] = pd.DataFrame(calc_columns, index=df.index)
-        df["email_department_manager"] = ""
 
         preferred = [
             "מקור",
@@ -701,9 +722,6 @@ class BoosterProcessor(BaseVoucherProcessor):
             "סיבת התראה",
             "גוף דוא״ל",
             "email_target",
-            "email_employee",
-            "email_direct_manager",
-            "email_department_manager",
         ]
         return df[preferred]
 
@@ -799,8 +817,6 @@ class GilboaProcessor(BaseVoucherProcessor):
                     email_body,
                     email_target,
                     alert_reason,
-                    "",
-                    "",
                 ]
             )
 
@@ -815,11 +831,8 @@ class GilboaProcessor(BaseVoucherProcessor):
                 "גוף דוא״ל",
                 "email_target",
                 "סיבת התראה",
-                "email_employee",
-                "email_direct_manager",
             ]
         ] = pd.DataFrame(calc_columns, index=df.index)
-        df["email_department_manager"] = ""
 
         added_columns = [
             "מס' ימים ליציאה",
@@ -831,9 +844,6 @@ class GilboaProcessor(BaseVoucherProcessor):
             "סיבת התראה",
             "גוף דוא״ל",
             "email_target",
-            "email_employee",
-            "email_direct_manager",
-            "email_department_manager",
         ]
         leading_columns = [
             "מקור",
