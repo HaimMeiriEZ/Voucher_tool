@@ -76,6 +76,52 @@ def safe_datetime(value, *, dayfirst: bool = False) -> Optional[datetime]:
     return result.to_pydatetime()
 
 
+def parse_booster_date_from_filename(input_path: str) -> datetime:
+    file_name = os.path.basename(input_path)
+    name_without_ext = os.path.splitext(file_name)[0]
+    match = re.search(r"(\d{1,2})[\s\-_/]+([A-Za-z]{3,9})[\s\-_/]+(\d{4})", name_without_ext)
+    if not match:
+        raise ProcessingError("לא נמצא תאריך בשם קובץ BOOSTER. פורמט נדרש: 12 Apr 2026")
+
+    day = int(match.group(1))
+    month_text = match.group(2).strip().lower()
+    year = int(match.group(3))
+    month_map = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+    month = month_map.get(month_text)
+    if month is None:
+        raise ProcessingError(f"חודש לא תקין בשם קובץ BOOSTER: {match.group(2)}")
+
+    try:
+        return datetime(year, month, day)
+    except ValueError as exc:
+        raise ProcessingError(f"תאריך לא תקין בשם קובץ BOOSTER: {match.group(0)}") from exc
+
+
 def build_alert_fields(days_to_departure: Optional[int], is_private: bool) -> tuple[str, str, str, str]:
     if not is_private or days_to_departure is None:
         return "", "", "", ""
@@ -531,7 +577,15 @@ class BaseVoucherProcessor:
                 threat_7.to_excel(writer, sheet_name="עלול להתבטל", index=False)
 
         workbook = load_workbook(output_path)
-        date_columns = {"Open", "Start", "Start Date", "End Date", "תאריך עידכון הערת סוכן"}
+        date_columns = {
+            "Open",
+            "Start",
+            "Start Date",
+            "End Date",
+            "Open Date",
+            "Value Date",
+            "תאריך עידכון הערת סוכן",
+        }
         integer_columns = {"Number", "מס' ימים ליציאה", "מס' ימי החזר"}
         decimal_columns = {"Ref wl", "Attr", "Credit", "Balance", "Unconfirmed Refund"}
 
@@ -594,7 +648,9 @@ class BoosterProcessor(BaseVoucherProcessor):
     history_key_columns = ["מזהה רשומה", "T. File No."]
 
     def get_anchor_date(self, input_path: str) -> datetime:
-        return super().get_anchor_date(input_path)
+        anchor = parse_booster_date_from_filename(input_path)
+        self.log(f"תאריך העוגן של BOOSTER נקבע משם הקובץ: {anchor.strftime('%d/%m/%Y')}")
+        return anchor
 
     def load_input(self, input_path: str) -> pd.DataFrame:
         self.log("קורא קובץ BOOSTER")
@@ -606,6 +662,8 @@ class BoosterProcessor(BaseVoucherProcessor):
                 "Branch",
                 "T. File No.",
                 "User",
+                "Open Date",
+                "Value Date",
                 "Start Date",
                 "End Date",
                 "T. File Name",
@@ -619,6 +677,8 @@ class BoosterProcessor(BaseVoucherProcessor):
             [
                 "T. File No.",
                 "User",
+                "Open Date",
+                "Value Date",
                 "Start Date",
                 "End Date",
                 "T. File Name",
@@ -635,6 +695,8 @@ class BoosterProcessor(BaseVoucherProcessor):
         history: Dict[str, Dict[str, str]],
         anchor_date: datetime,
     ) -> pd.DataFrame:
+        df["Open Date"] = pd.to_datetime(df["Open Date"], errors="coerce")
+        df["Value Date"] = pd.to_datetime(df["Value Date"], errors="coerce")
         df["Start Date"] = pd.to_datetime(df["Start Date"], errors="coerce")
         df["User"] = df["User"].astype(str).str.strip()
         df["מקור"] = self.source_name
@@ -642,25 +704,37 @@ class BoosterProcessor(BaseVoucherProcessor):
 
         run_date = anchor_date.date()
         calc_columns = []
+        current_record_ids = set()
+        positive_refund_ids = set()
         for _, row in df.iterrows():
             record_id = normalize_identifier(row["T. File No."])
+            if record_id:
+                current_record_ids.add(record_id)
             start_date = row["Start Date"] if pd.notna(row["Start Date"]) else None
-            if start_date is not None:
-                state[f"{self.source_name}:{record_id}"] = {"open_date": str(start_date)}
+            state_key = f"{self.source_name}:{record_id}" if record_id else ""
 
             start_date_only = start_date.date() if start_date is not None else None
             days_to_departure = (
                 int((start_date_only - run_date).days) if start_date_only is not None else None
             )
 
-            state_entry = state.get(f"{self.source_name}:{record_id}", {})
-            open_date = safe_datetime(state_entry.get("open_date", ""))
-            days_since_refund = (anchor_date - open_date).days if open_date else 0
-
             refund_value = pd.to_numeric(row.get("Unconfirmed Refund", 0), errors="coerce")
             refund_value = 0 if pd.isna(refund_value) else float(refund_value)
+            refund_positive = refund_value > 0
+
+            if refund_positive and record_id:
+                positive_refund_ids.add(record_id)
+                state_entry = state.get(state_key, {})
+                recognition_date = safe_datetime(state_entry.get("open_date", ""))
+                if recognition_date is None:
+                    state[state_key] = {"open_date": str(anchor_date)}
+                    recognition_date = anchor_date
+                days_since_refund = (anchor_date - recognition_date).days
+            else:
+                days_since_refund = 0
+
             refund_note = ""
-            if refund_value > 0:
+            if refund_positive:
                 refund_note = "החזר שטרם אושר מעל 60 יום" if days_since_refund > 60 else "החזר שטרם אושר"
 
             is_private = safe_text(row["Agent/C. Client"]) == "Direct Sale"
@@ -688,6 +762,23 @@ class BoosterProcessor(BaseVoucherProcessor):
                 ]
             )
 
+        booster_prefix = f"{self.source_name}:"
+        removed_missing = 0
+        removed_non_positive = 0
+        for state_key in [k for k in state.keys() if k.startswith(booster_prefix)]:
+            record_id = state_key[len(booster_prefix):]
+            if record_id not in current_record_ids:
+                del state[state_key]
+                removed_missing += 1
+            elif record_id not in positive_refund_ids:
+                del state[state_key]
+                removed_non_positive += 1
+        if removed_missing or removed_non_positive:
+            self.log(
+                "ניקוי JSON BOOSTER: "
+                f"נמחקו {removed_missing} רשומות שלא הופיעו בקובץ ו-{removed_non_positive} רשומות ללא החזר חיובי"
+            )
+
         df[
             [
                 "מס' ימים ליציאה",
@@ -707,6 +798,8 @@ class BoosterProcessor(BaseVoucherProcessor):
             "מזהה רשומה",
             "T. File No.",
             "User",
+            "Open Date",
+            "Value Date",
             "Start Date",
             "End Date",
             "T. File Name",
