@@ -1,29 +1,134 @@
-# Voucher Tool
+# כלי ניהול ובקרת דוקטים לגבייה — Voucher Tool
 
-Desktop tool for managing and validating voucher reports for Booster and Gilboa.
+כלי שולחן עבודה לניהול ובקרה של הזמנות פתוחות לגבייה ממערכות BOOSTER ו-GILBOA, עם שליחת דוחות אוטומטית לסוכנים דרך Outlook.
 
-## Features
-- Hebrew RTL desktop UI (PySide6)
-- Manual loading for Booster and Gilboa source files
-- Output folder selection by the user
-- Embedded activity log during processing
-- Unified Excel export — split by source (מקור) into separate sheets, empty columns removed automatically
-- Agent email preparation via Outlook (win32com):
-  - **Matched agents** (email found in `agents_config.json`): Outlook draft created in the configured subfolder, with up to 3 Excel attachments (all open orders, upcoming departures, at-risk cancellations) and CC to branch/department managers
-  - **Unmatched agents** (no email): `.msg` files saved to `ממתינות מייל - כתובת חסרה/` subfolder inside the output folder, with CC to the operations team; subfolder is created automatically if it does not exist
-- Run state persisted in `voucher_state.json` (auto-created on first run)
+---
 
-## Dependencies
-- `pandas>=2.2`
-- `openpyxl>=3.1`
-- `PySide6>=6.8`
-- `pywin32>=306` — required for Outlook COM automation (`.msg` file creation and draft saving)
+## תיאור כללי
 
-## Run
-1. Create or activate a Python virtual environment
-2. Install dependencies: `pip install -r requirements.txt`
-3. Run `voucher_app.py` directly or use `start_voucher_tool.bat`
+האפליקציה מאחדת נתוני הזמנות ממערכת **BOOSTER** (קובץ Excel) ומערכת **GILBOA** (קובץ TXT עם מפריד `^`), מבצעת חישובי בקרה עסקית, מייצאת דוחות Excel מפורטים ומאפשרת הכנת מיילים ממוקדים לכל סוכן דרך Outlook.
 
-## Configuration
-- `agents_config.json` — maps agent names/keys to email addresses and routing metadata (not committed to source control)
-- `voucher_state.json` — persists last-used file paths between sessions (auto-created, not committed)
+---
+
+## תהליך עבודה מלא
+
+```
+1. בחר תיקיית פלט
+2. טען טבלת סוכנים (Excel)
+3. קלוט קובץ BOOSTER ו/או GILBOA → מופק דוח Excel
+4. הכן מיילים לסוכנים → נוצרות טיוטות Outlook
+5. [אופציונלי] קלוט תגובות סוכנים → ההערות מוזגות חזרה לדוחות
+```
+
+---
+
+## פונקציונאליות מפורטת
+
+### ממשק משתמש
+- ממשק RTL בעברית (PySide6)
+- בחירה ידנית של תיקיית פלט
+- טעינת טבלת סוכנים — שומר את הנתיב ב-`agents_config.json` לשימוש חוזר
+- לוג פעילות מוטבע בחלון בזמן אמת
+- לוג מפורט נוסף נכתב לקובץ `voucher_tool.log`
+- כרטיסי סיכום (StatCards) — מציגים כמה סוכנים שויכו לכתובת מייל ולכמה חסרה כתובת
+
+### עיבוד BOOSTER
+- קורא מגיליון `Ext. T. File Report` (קופץ 8 שורות כותרת)
+- **תאריך עוגן** נלקח משם הקובץ (פורמט: `12 Apr 2026`)
+- מחשב `מס' ימים ליציאה` לפי `Start Date` מול תאריך העוגן
+- מזהה הזמנות `Direct Sale` (פרטיות) לצורך חישוב התראות
+- **הערה מערכת**: "טרם הופקה חשבונית" לכל הזמנה שאינה Direct Sale; "החזר שטרם אושר" כשיש ערך ב-`Unconfirmed Refund`; שילוב שניהם כשרלוונטי
+- מעקב ימי החזר (`Unconfirmed Refund > 0`) — מעל 60 יום נוסף "מעל 60 יום"
+
+### עיבוד GILBOA
+- קורא קובץ TXT עם מפריד `^` — מנסה קידוד `cp1255`, `utf-8-sig`, `utf-8` בהתאמה
+- **תאריך עוגן** לפי תאריך שינוי הקובץ
+- מחשב `מס' ימים ליציאה` לפי עמודת `Start`
+- מזהה הזמנות פרטיות לפי שדה `C.Client` ריק
+- **הערה מערכת**: "טרם הופקה חשבונית" כש-`C.Client` מלא; "החזר שטרם אושר" כש-`Ref wl ≠ 0`
+
+### לוגיקת התראות (BOOSTER + GILBOA — הזמנות פרטיות בלבד)
+| ימים ליציאה | קטגוריה | צבע בדוח |
+|---|---|---|
+| 8–14 | "התראה שבועיים לפני היציאה" | צהוב (Neutral) |
+| 0–7 | "עלול להתבטל" | אדום (Bad) |
+
+### ייצוא דוחות Excel
+כל ריצה מייצרת קובץ: `דוח בקרת דוקטים לגבייה <מקור> <חותמת-זמן>.xlsx`
+
+גיליונות בקובץ:
+- **דוח מלא** — כל הרשומות
+- **אזהרה שבועיים** — רשומות בקטגוריית "התראה שבועיים לפני היציאה" (אם קיימות)
+- **עלול להתבטל** — רשומות בקטגוריית "עלול להתבטל" (אם קיימות)
+
+עיצוב אוטומטי: פורמט תאריכים (`DD/MM/YYYY`), מספרים שלמים ועשרוניים, צבעי שורה לפי קטגוריה.
+
+### הכנת מיילים לסוכנים
+1. טוען את דוחות BOOSTER ו-GILBOA האחרונים מתיקיית הפלט
+2. ממזג לפי מפתח הסוכן (עמודת `User` / `Clerk`) מול טבלת הסוכנים
+3. **סוכן עם כתובת מייל** — יוצר טיוטת Outlook עם:
+   - קובץ Excel מצורף (הזמנות פתוחות, ממוינות לפי עדיפות התראה)
+   - גוף מייל HTML ב-RTL עם סיכום כמותי
+   - CC: מנהל סניף, מנהל תחום, ושדות נוספים מטבלת הסוכנים
+4. **סוכן ללא כתובת מייל** — שומר קובץ `.msg` בתיקייה `ממתינות מייל - כתובת חסרה/` עם CC לצוות תפעול
+
+### קליטת תגובות סוכנים
+1. קורא קבצי Excel מתיקייה `תגובות סוכנים/` בתוך תיקיית הפלט
+2. מחפש עמודות: `מקור`, `מזהה רשומה`, `הערות סוכן`, `תאריך עידכון הערת סוכן`
+3. שומר את ההערות ב-`agent_notes.json`
+4. מעדכן in-place את קבצי הדוח האחרונים (BOOSTER ו/או GILBOA) עם ההערות שהתקבלו
+
+### שמירת מצב (State)
+- `voucher_state.json` — שומר תאריך הכרה ראשון לכל רשומה שיש בה החזר פתוח, לצורך חישוב "מס' ימי החזר"
+- מנקה אוטומטית רשומות שנעלמו מהקובץ או שאין בהן יותר החזר
+- `agent_notes.json` — מאגד את כל הערות הסוכנים שהתקבלו; מוזגות לדוחות בכל ריצה עתידית
+
+---
+
+## קבצי קונפיגורציה
+| קובץ | תיאור |
+|---|---|
+| `agents_config.json` | נתיב לטבלת הסוכנים (נשמר אוטומטית בעת בחירה בממשק) |
+| `voucher_state.json` | מצב ריצה — תאריכי הכרה של החזרים פתוחים (נוצר אוטומטית) |
+| `agent_notes.json` | הערות שסוכנים החזירו — מוזגות לדוחות (נוצר אוטומטית) |
+
+> קבצי JSON אלו נוצרים אוטומטית ואינם מחויבים ל-source control.
+
+---
+
+## תלויות
+```
+pandas>=2.2
+openpyxl>=3.1
+PySide6>=6.8
+pywin32>=306        # נדרש עבור אוטומציית Outlook (COM)
+```
+
+---
+
+## הרצה
+```bash
+# 1. יצירה/הפעלה של Virtual Environment
+python -m venv .venv
+.venv\Scripts\activate
+
+# 2. התקנת תלויות
+pip install -r requirements.txt
+
+# 3. הרצה
+python voucher_app.py
+# או
+start_voucher_tool.bat
+```
+
+---
+
+## מבנה הפרויקט
+```
+voucher_app.py              — האפליקציה הראשית
+agents_config.json          — קונפיגורציית נתיב טבלת סוכנים
+requirements.txt            — תלויות Python
+start_voucher_tool.bat      — קובץ הפעלה מהיר
+PySide6_Hebrew_RTL_Guide.md — הנחיות פיתוח RTL ב-PySide6
+README.md                   — מסמך זה
+```
