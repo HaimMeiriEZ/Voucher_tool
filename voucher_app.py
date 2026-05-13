@@ -24,13 +24,107 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 APP_TITLE = "כלי ניהול ובקרת דוקטים לגבייה"
+
+MODERN_STYLE = """
+    QMainWindow { background-color: #f5f7fa; }
+    QWidget { font-family: 'Segoe UI', 'Arial'; font-size: 14px; color: #333; }
+    QFrame#Card {
+        background-color: white;
+        border-radius: 12px;
+        border: 1px solid #e1e4e8;
+    }
+    QLabel#HeaderLabel {
+        font-size: 22px;
+        font-weight: bold;
+        color: #1a2a6c;
+    }
+    QLabel#SectionTitle {
+        font-size: 15px;
+        font-weight: bold;
+        color: #2c3e50;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 4px;
+    }
+    QLineEdit {
+        padding: 8px 10px;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        background: #fff;
+    }
+    QLineEdit:focus { border: 2px solid #3498db; }
+    QLineEdit:read-only {
+        background: #f0f4f8;
+        color: #334155;
+        border: 1px solid #cbd5e1;
+    }
+    QPushButton {
+        background-color: #3498db;
+        color: white;
+        padding: 8px 16px;
+        border-radius: 8px;
+        font-weight: bold;
+        border: none;
+    }
+    QPushButton:hover { background-color: #2980b9; }
+    QPushButton:disabled { background-color: #94a3b8; }
+    QPushButton#SecondaryBtn { background-color: #95a5a6; }
+    QPushButton#SecondaryBtn:hover { background-color: #7f8c8d; }
+    QPushButton#ActionBtn {
+        background-color: #27ae60;
+        font-size: 14px;
+        min-height: 40px;
+    }
+    QPushButton#ActionBtn:hover { background-color: #219150; }
+    QPushButton#ActionBtn:disabled { background-color: #94a3b8; }
+    QPushButton#EmailBtn {
+        background-color: #e67e22;
+        font-size: 14px;
+        min-height: 40px;
+        font-weight: bold;
+    }
+    QPushButton#EmailBtn:hover { background-color: #ca6f1e; }
+    QPushButton#EmailBtn:disabled { background-color: #94a3b8; }
+    QTextEdit#LogArea {
+        background-color: #10151c;
+        color: #d8e2f0;
+        font-family: 'Consolas', 'Courier New';
+        border-radius: 8px;
+        padding: 10px;
+        font-size: 12px;
+        border: 1px solid #2b3a4f;
+    }
+    QTabWidget::pane {
+        border: 1px solid #e1e4e8;
+        border-radius: 8px;
+        background: #f5f7fa;
+    }
+    QTabBar::tab {
+        background: #ecf0f1;
+        padding: 9px 20px;
+        margin-right: 2px;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        font-weight: bold;
+    }
+    QTabBar::tab:selected { background: white; color: #1a2a6c; }
+    QProgressBar {
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        min-height: 8px;
+        max-height: 8px;
+    }
+    QProgressBar::chunk { background-color: #27ae60; border-radius: 5px; }
+"""
+
 STATE_FILE_NAME = "voucher_state.json"
 AGENTS_CONFIG_FILE_NAME = "agents_config.json"
 AGENT_NOTES_FILE_NAME = "agent_notes.json"
@@ -285,6 +379,7 @@ def create_outlook_draft(
     subfolder_name: str = "",
     save_as_path: str = "",
     attachments: list[str] | None = None,
+    high_importance: bool = False,
 ) -> None:
     try:
         import win32com.client
@@ -297,6 +392,8 @@ def create_outlook_draft(
         mail.CC = "; ".join(cc_emails)
     mail.Subject = subject
     mail.HTMLBody = html_body
+    if high_importance:
+        mail.Importance = 2  # olImportanceHigh
     if attachments:
         for att_path in attachments:
             mail.Attachments.Add(att_path)
@@ -343,6 +440,9 @@ def _sanitize_filename_component(value: str) -> str:
 def _prepare_sorted_open_orders(rows_df: pd.DataFrame, routing_cols: set[str]) -> tuple[pd.DataFrame, list[str]]:
     working = rows_df.copy()
     required_display_cols = {"הערות סוכן", "תאריך עידכון הערת סוכן"}
+    for col in required_display_cols:
+        if col not in working.columns:
+            working[col] = ""
     category_col = "email_target" if "email_target" in working.columns else None
     if category_col:
         priority = {
@@ -356,8 +456,15 @@ def _prepare_sorted_open_orders(rows_df: pd.DataFrame, routing_cols: set[str]) -
         working = working.reset_index(drop=True)
         categories = [""] * len(working)
 
-    display_cols = [c for c in working.columns if (c not in routing_cols and c != "_priority") or c in required_display_cols]
+    note_cols_order = ["הערות סוכן", "תאריך עידכון הערת סוכן"]
+    display_cols = [
+        c for c in working.columns
+        if (c not in routing_cols and c != "_priority") and c not in required_display_cols
+    ]
     display_cols = [c for c in display_cols if c in working.columns]
+    for col in note_cols_order:
+        if col in working.columns:
+            display_cols.append(col)
     return working[display_cols].reset_index(drop=True), categories
 
 
@@ -490,7 +597,7 @@ def prepare_agent_emails(
         html_body = '<html><head></head><body dir="rtl">' + "".join(body_lines) + "</body></html>"
 
         subject = f"דוח בקרת דוקטים לגבייה \u2014 {agent_name} \u2014 {today_str}"
-        create_outlook_draft(to_email, cc_emails, subject, html_body, attachments=tmp_files)
+        create_outlook_draft(to_email, cc_emails, subject, html_body, attachments=tmp_files, high_importance=bool(count_warning or count_cancel))
         logger(f"נוצרה טיוטה עבור: {agent_name} ({to_email})")
         count += 1
         for p in tmp_files:
@@ -540,7 +647,7 @@ def prepare_agent_emails(
             safe_key = agent_key_str.replace("/", "-").replace("\\", "-")
             msg_path = os.path.join(unmatched_out_dir, f"דוח {safe_key} {today_str.replace('/', '.')}.msg")
             _UNMATCHED_CC = ["ilanit_b@ophirtours.co.il", "YWaksman@mycwt.co.il"]
-            create_outlook_draft("", _UNMATCHED_CC, subject, html_body, save_as_path=msg_path, attachments=tmp_files)
+            create_outlook_draft("", _UNMATCHED_CC, subject, html_body, save_as_path=msg_path, attachments=tmp_files, high_importance=bool(count_warning or count_cancel))
             logger(f"קובץ מייל נשמר: {os.path.basename(msg_path)}")
             count += 1
             for p in tmp_files:
@@ -559,7 +666,10 @@ def prepare_agent_emails(
 def import_agent_responses(output_dir: str, logger: Callable[[str], None]) -> int:
     responses_dir = os.path.join(output_dir, AGENT_RESPONSES_FOLDER)
     if not os.path.exists(responses_dir):
-        raise ProcessingError(f"תיקיית התגובות לא נמצאה: {responses_dir}\nיש ליצור את התיקייה ולשמור בה את הקבצים שהסוכנים החזירו")
+        os.makedirs(responses_dir, exist_ok=True)
+        logger(f"נוצרה תיקיית תגובות סוכנים: {responses_dir}")
+        logger("התיקייה ריקה — יש להכניס קבצי Excel עם תגובות הסוכנים ולהפעיל שוב")
+        return 0
 
     notes_path = os.path.join(output_dir, AGENT_NOTES_FILE_NAME)
     if os.path.exists(notes_path):
@@ -1372,143 +1482,154 @@ class MainWindow(QMainWindow):
             self.agent_table_path = _saved
 
         self.setWindowTitle(APP_TITLE)
-        self.resize(950, 680)
+        self.resize(1000, 750)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.setStyleSheet(MODERN_STYLE)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
 
-        layout = QVBoxLayout(central_widget)
-        layout.setSpacing(12)
-
+        # --- Header ---
+        header_layout = QHBoxLayout()
         title_label = QLabel(APP_TITLE)
-        title_font = QFont()
-        title_font.setPointSize(16)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        title_label.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        title_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(
-            title_label,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
-        )
+        title_label.setObjectName("HeaderLabel")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        date_label = QLabel(datetime.now().strftime("%d/%m/%Y"))
+        date_label.setStyleSheet("color: #7f8c8d; font-weight: bold;")
+        header_layout.addWidget(date_label)
+        main_layout.addLayout(header_layout)
 
-        subtitle = QLabel(
-            "בחירת תיקיית פלט, ולאחר מכן טעינת קובץ \u2066BOOSTER\u2069 או \u2066GILBOA\u2069"
-        )
-        subtitle.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        subtitle.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(
-            subtitle,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
-        )
+        # --- Tabs ---
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
 
+        # ===== MAIN TAB =====
+        main_tab = QWidget()
+        tab_layout = QVBoxLayout(main_tab)
+        tab_layout.setSpacing(16)
+        tab_layout.setContentsMargins(16, 16, 16, 16)
+
+        # Output Folder Card
+        output_card = QFrame()
+        output_card.setObjectName("Card")
+        output_card_layout = QVBoxLayout(output_card)
+        output_card_layout.setContentsMargins(16, 12, 16, 12)
+        sec1 = QLabel("📁 תיקיית פלט")
+        sec1.setObjectName("SectionTitle")
+        output_card_layout.addWidget(sec1)
         path_layout = QHBoxLayout()
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setPlaceholderText("בחר תיקיית פלט לשמירת הדוחות וההיסטוריה")
         self.output_path_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         browse_button = QPushButton("בחר תיקיית פלט")
+        browse_button.setObjectName("SecondaryBtn")
         browse_button.clicked.connect(self.choose_output_dir)
         path_layout.addWidget(browse_button)
-        path_layout.addWidget(self.output_path_edit)
-        layout.addLayout(path_layout)
+        path_layout.addWidget(self.output_path_edit, stretch=1)
+        output_card_layout.addLayout(path_layout)
+        tab_layout.addWidget(output_card)
 
+        # Agent Table Card
+        agent_card = QFrame()
+        agent_card.setObjectName("Card")
+        agent_card_layout = QVBoxLayout(agent_card)
+        agent_card_layout.setContentsMargins(16, 12, 16, 12)
+        sec2 = QLabel("👤 טבלת סוכנים")
+        sec2.setObjectName("SectionTitle")
+        agent_card_layout.addWidget(sec2)
         agent_layout = QHBoxLayout()
         self.agent_path_edit = QLineEdit()
         self.agent_path_edit.setReadOnly(True)
         self.agent_path_edit.setPlaceholderText("טבלת סוכנים לא נטענה")
         self.agent_path_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.agent_path_edit.setStyleSheet(
-            "background: #f0f4f8; color: #334155; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px;"
-        )
         if self.agent_table_path:
             self.agent_path_edit.setText(self.agent_table_path)
         agent_browse_button = QPushButton("קליטת טבלת סוכנים")
+        agent_browse_button.setObjectName("SecondaryBtn")
         agent_browse_button.clicked.connect(self.choose_agent_table)
         agent_layout.addWidget(agent_browse_button)
         agent_layout.addWidget(self.agent_path_edit, stretch=1)
-        layout.addLayout(agent_layout)
+        agent_card_layout.addLayout(agent_layout)
+        tab_layout.addWidget(agent_card)
 
+        # Actions Card
+        actions_card = QFrame()
+        actions_card.setObjectName("Card")
+        actions_card_layout = QVBoxLayout(actions_card)
+        actions_card_layout.setContentsMargins(16, 12, 16, 12)
+        sec3 = QLabel("⚡ פעולות מהירות")
+        sec3.setObjectName("SectionTitle")
+        actions_card_layout.addWidget(sec3)
         buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(10)
         self.booster_button = QPushButton("קליטת קובץ בוסטר")
+        self.booster_button.setObjectName("ActionBtn")
         self.gilboa_button = QPushButton("קליטת קובץ גילבוע")
-        self.email_button = QPushButton("הכנת מיילים לסוכנים")
+        self.gilboa_button.setObjectName("ActionBtn")
+        self.email_button = QPushButton("📧 הכנת מיילים לסוכנים")
+        self.email_button.setObjectName("EmailBtn")
         self.import_button = QPushButton("קליטת תגובות סוכנים")
+        self.import_button.setObjectName("ActionBtn")
         self.booster_button.clicked.connect(lambda: self.select_and_run(BoosterProcessor, "קבצי Excel (*.xlsx *.xls)"))
         self.gilboa_button.clicked.connect(lambda: self.select_and_run(GilboaProcessor, "קבצי טקסט (*.txt)"))
         self.email_button.clicked.connect(self.start_email_worker)
         self.import_button.clicked.connect(self.start_import_worker)
         buttons_layout.addWidget(self.booster_button)
         buttons_layout.addWidget(self.gilboa_button)
-        layout.addLayout(buttons_layout)
+        buttons_layout.addWidget(self.email_button)
+        buttons_layout.addWidget(self.import_button)
+        actions_card_layout.addLayout(buttons_layout)
+        tab_layout.addWidget(actions_card)
 
-        stats_title = QLabel("סיכום שיוך סוכנים לכתובות מייל")
-        stats_title.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        stats_title.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
-        )
-        stats_title_font = QFont("Arial", 9, QFont.Weight.Bold)
-        stats_title.setFont(stats_title_font)
-        stats_title.setStyleSheet("color: #475569;")
-        layout.addWidget(
-            stats_title,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
-        )
-
+        # Stats Card
+        stats_card = QFrame()
+        stats_card.setObjectName("Card")
+        stats_card_layout = QVBoxLayout(stats_card)
+        stats_card_layout.setContentsMargins(16, 12, 16, 12)
+        sec4 = QLabel("📊 סיכום שיוך סוכנים לכתובות מייל")
+        sec4.setObjectName("SectionTitle")
+        stats_card_layout.addWidget(sec4)
         stats_layout = QHBoxLayout()
         stats_layout.setSpacing(12)
         self.stat_unmatched = StatCard("unmatched")
         self.stat_matched = StatCard("matched")
         stats_layout.addWidget(self.stat_unmatched)
         stats_layout.addWidget(self.stat_matched)
-        layout.addLayout(stats_layout)
+        stats_card_layout.addLayout(stats_layout)
+        tab_layout.addWidget(stats_card)
 
-        email_layout = QHBoxLayout()
-        email_layout.addWidget(self.email_button)
-        email_layout.addWidget(self.import_button)
-        layout.addLayout(email_layout)
+        # Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(False)
+        tab_layout.addWidget(self.progress_bar)
 
-        self.status_label = QLabel("מצב: מוכן")
-        self.status_label.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.status_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
-        )
-        self.status_label.setMinimumWidth(140)
-        layout.addWidget(
-            self.status_label,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
-        )
+        tab_layout.addStretch()
+        self.tabs.addTab(main_tab, "מסך ראשי")
 
-        log_title = QLabel("לוג פעילות")
-        log_title.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        log_title.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        log_title.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(
-            log_title,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignAbsolute,
-        )
-
+        # ===== LOGS TAB =====
+        logs_tab = QWidget()
+        logs_layout = QVBoxLayout(logs_tab)
+        logs_layout.setContentsMargins(16, 16, 16, 16)
+        logs_layout.setSpacing(8)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setObjectName("LogArea")
         self.log_view.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.log_view.setStyleSheet(
-            "background-color: #10151c; color: #d8e2f0; border: 1px solid #2b3a4f;"
-            "font-family: Consolas, 'Courier New', monospace; font-size: 12px;"
-        )
-        layout.addWidget(self.log_view)
+        logs_layout.addWidget(self.log_view)
+        clear_btn = QPushButton("נקה לוג")
+        clear_btn.setObjectName("SecondaryBtn")
+        clear_btn.setFixedWidth(100)
+        clear_btn.clicked.connect(self.log_view.clear)
+        logs_layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.tabs.addTab(logs_tab, "לוג פעילות")
 
-        self.setStyleSheet(
-            "QWidget { background: #f5f7fb; color: #16212f; }"
-            "QPushButton { background: #1f6feb; color: white; border-radius: 6px; padding: 8px 14px; }"
-            "QPushButton:disabled { background: #94a3b8; }"
-            "QLineEdit { background: white; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; }"
-        )
+        # Status Bar
+        self.statusBar().showMessage("מוכן לעבודה")
 
         if self.agent_table_path:
             self.append_log(f"טבלת סוכנים נטענה אוטומטית: {self.agent_table_path}")
@@ -1517,6 +1638,7 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.append(f"[{timestamp}] {message}")
+        self.statusBar().showMessage(message)
         _logger.info(message)
 
     def choose_output_dir(self) -> None:
@@ -1525,6 +1647,10 @@ class MainWindow(QMainWindow):
             self.output_dir = selected_dir
             self.output_path_edit.setText(selected_dir)
             self.append_log(f"נבחרה תיקיית פלט: {selected_dir}")
+            responses_dir = os.path.join(selected_dir, AGENT_RESPONSES_FOLDER)
+            if not os.path.exists(responses_dir):
+                os.makedirs(responses_dir, exist_ok=True)
+                self.append_log(f"נוצרה תיקיית תגובות סוכנים: {responses_dir}")
 
     def select_and_run(self, processor_cls, file_filter: str) -> None:
         output_dir = self.output_path_edit.text().strip()
@@ -1543,7 +1669,14 @@ class MainWindow(QMainWindow):
         self.booster_button.setDisabled(is_busy)
         self.gilboa_button.setDisabled(is_busy)
         self.email_button.setDisabled(is_busy)
-        self.status_label.setText("מצב: מעבד..." if is_busy else "מצב: מוכן")
+        self.progress_bar.setVisible(is_busy)
+        if is_busy:
+            self.progress_bar.setRange(0, 0)
+            self.statusBar().showMessage("מעבד...")
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self.statusBar().showMessage("מוכן לעבודה")
 
     def start_worker(self, processor_cls, input_path: str, output_dir: str) -> None:
         if self.worker_thread is not None and self.worker_thread.isRunning():
